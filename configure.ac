@@ -1,4 +1,4 @@
-AC_INIT([DCTFilter], [1], [https://github.com/HomeOfVapourSynthEvolution/VapourSynth-DCTFilter/issues], [DCTFilter], [https://github.com/HomeOfVapourSynthEvolution/VapourSynth-DCTFilter/])
+AC_INIT([DCTFilter], [2], [https://github.com/HomeOfVapourSynthEvolution/VapourSynth-DCTFilter/issues], [DCTFilter], [https://github.com/HomeOfVapourSynthEvolution/VapourSynth-DCTFilter/])
 
 : ${CXXFLAGS=""}
 

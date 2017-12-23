@@ -39,7 +39,7 @@ struct DCTFilterData {
     const VSVideoInfo * vi;
     bool process[3];
     int peak;
-    alignas(16) float factors[64];
+    float factors[64];
     fftwf_plan dct, idct;
     std::unordered_map<std::thread::id, float *> buffer;
 };
