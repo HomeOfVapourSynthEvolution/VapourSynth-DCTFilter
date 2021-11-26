@@ -3,7 +3,7 @@ Description
 
 For each 8x8 block, DCTFilter will do a Discrete Cosine Transform (DCT), scale down the selected frequency values, and then reverse the process with an Inverse Discrete Cosine Transform (IDCT).
 
-Requires libfftw3f-3.dll to be in the search path. http://www.fftw.org/install/windows.html
+Requires libfftw3f, and on Windows, the release statically links it so there is no need to obtain it separately.
 
 
 Usage
