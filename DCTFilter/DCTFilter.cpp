@@ -28,6 +28,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 #include <VapourSynth.h>
 #include <VSHelper.h>
@@ -39,7 +40,8 @@ struct DCTFilterData {
     const VSVideoInfo * vi;
     bool process[3];
     int peak;
-    float factors[64];
+    int n;
+    std::vector<float> factors;
     fftwf_plan dct, idct;
     std::unordered_map<std::thread::id, float *> buffer;
 };
@@ -57,28 +59,30 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, const DCTFilterDat
             const T * srcp = reinterpret_cast<const T *>(vsapi->getReadPtr(src, plane));
             T * VS_RESTRICT dstp = reinterpret_cast<T *>(vsapi->getWritePtr(dst, plane));
 
-            for (int y = 0; y < height; y += 8) {
-                for (int x = 0; x < width; x += 8) {
-                    for (int yy = 0; yy < 8; yy++) {
+            const int n = d->n;
+	    const float norm = 1.f / (d->n * d->n * 4);
+            for (int y = 0; y < height; y += n) {
+                for (int x = 0; x < width; x += n) {
+                    for (int yy = 0; yy < n; yy++) {
                         const T * input = srcp + stride * yy + x;
-                        float * VS_RESTRICT output = buffer + 8 * yy;
+                        float * VS_RESTRICT output = buffer + n * yy;
 
-                        for (int xx = 0; xx < 8; xx++)
-                            output[xx] = input[xx] * (1.f / 256.f);
+                        for (int xx = 0; xx < n; xx++)
+                            output[xx] = input[xx] * norm;
                     }
 
                     fftwf_execute_r2r(d->dct, buffer, buffer);
 
-                    for (int i = 0; i < 64; i++)
+                    for (int i = 0; i < n*n; i++)
                         buffer[i] *= d->factors[i];
 
                     fftwf_execute_r2r(d->idct, buffer, buffer);
 
-                    for (int yy = 0; yy < 8; yy++) {
-                        const float * input = buffer + 8 * yy;
+                    for (int yy = 0; yy < n; yy++) {
+                        const float * input = buffer + n * yy;
                         T * VS_RESTRICT output = dstp + stride * yy + x;
 
-                        for (int xx = 0; xx < 8; xx++) {
+                        for (int xx = 0; xx < n; xx++) {
                             if (std::is_integral<T>::value)
                                 output[xx] = std::min(std::max(static_cast<int>(input[xx] + 0.5f), 0), d->peak);
                             else
@@ -87,8 +91,8 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, const DCTFilterDat
                     }
                 }
 
-                srcp += stride * 8;
-                dstp += stride * 8;
+                srcp += stride * n;
+                dstp += stride * n;
             }
         }
     }
@@ -109,7 +113,7 @@ static const VSFrameRef *VS_CC dctfilterGetFrame(int n, int activationReason, vo
             auto threadId = std::this_thread::get_id();
 
             if (!d->buffer.count(threadId)) {
-                float * buffer = fftwf_alloc_real(64);
+                float * buffer = fftwf_alloc_real(d->n * d->n);
                 if (!buffer)
                     throw std::string{ "malloc failure (buffer)" };
                 d->buffer.emplace(threadId, buffer);
@@ -158,10 +162,19 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
     d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
 
-    const int padWidth = (d->vi->width & 15) ? 16 - d->vi->width % 16 : 0;
-    const int padHeight = (d->vi->height & 15) ? 16 - d->vi->height % 16 : 0;
+    int padWidth = 0, padHeight = 0;
 
     try {
+        int err;
+        int n = vsapi->propGetInt(in, "n", 0, &err);
+        if (err != 0) n = 8;
+        if (n < 0 || (n & (n - 1)) != 0)
+            throw std::string{ "n must be power of two and > 1" };
+        d->n = n;
+
+        padWidth = (d->vi->width & (2*n-1)) ? 2*n - d->vi->width % (2*n) : 0;
+        padHeight = (d->vi->height & (2*n-1)) ? 2*n - d->vi->height % (2*n) : 0;
+
         if (!isConstantFormat(d->vi) || (d->vi->format->sampleType == stInteger && d->vi->format->bitsPerSample > 16) ||
             (d->vi->format->sampleType == stFloat && d->vi->format->bitsPerSample != 32))
             throw std::string{ "only constant format 8-16 bit integer and 32 bit float input supported" };
@@ -185,10 +198,11 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
             d->process[n] = true;
         }
 
-        if (vsapi->propNumElements(in, "factors") != 8)
-            throw std::string{ "the number of factors must be 8" };
+        const int nfactors = vsapi->propNumElements(in, "factors");
+        if (nfactors != d->n && nfactors != d->n * d->n)
+            throw std::string{ "the number of factors must be equal to either n or n*n" };
 
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < nfactors; i++) {
             if (factors[i] < 0. || factors[i] > 1.)
                 throw std::string{ "factor must be between 0.0 and 1.0 (inclusive)" };
         }
@@ -224,17 +238,23 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
             vsapi->freeMap(ret);
         }
 
-        for (int y = 0; y < 8; y++) {
-            for (int x = 0; x < 8; x++)
-                d->factors[8 * y + x] = static_cast<float>(factors[y] * factors[x]);
+        d->factors.resize(d->n * d->n);
+        if (nfactors != d->n) {
+            for (int i = 0; i < nfactors; i++)
+                d->factors[i] = static_cast<float>(factors[i]);
+        } else {
+            for (int y = 0; y < d->n; y++) {
+                for (int x = 0; x < d->n; x++)
+                    d->factors[d->n * y + x] = static_cast<float>(factors[y] * factors[x]);
+            }
         }
 
-        float * buffer = fftwf_alloc_real(64);
+        float * buffer = fftwf_alloc_real(d->n * d->n);
         if (!buffer)
             throw std::string{ "malloc failure (buffer)" };
 
-        d->dct = fftwf_plan_r2r_2d(8, 8, buffer, buffer, FFTW_REDFT10, FFTW_REDFT10, FFTW_PATIENT);
-        d->idct = fftwf_plan_r2r_2d(8, 8, buffer, buffer, FFTW_REDFT01, FFTW_REDFT01, FFTW_PATIENT);
+        d->dct = fftwf_plan_r2r_2d(d->n, d->n, buffer, buffer, FFTW_REDFT10, FFTW_REDFT10, FFTW_PATIENT);
+        d->idct = fftwf_plan_r2r_2d(d->n, d->n, buffer, buffer, FFTW_REDFT01, FFTW_REDFT01, FFTW_PATIENT);
 
         fftwf_free(buffer);
     } catch (const std::string & error) {
@@ -279,6 +299,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegiste
     registerFunc("DCTFilter",
                  "clip:clip;"
                  "factors:float[];"
-                 "planes:int[]:opt;",
+                 "planes:int[]:opt;"
+                 "n:int:opt;",
                  dctfilterCreate, nullptr, plugin);
 }
