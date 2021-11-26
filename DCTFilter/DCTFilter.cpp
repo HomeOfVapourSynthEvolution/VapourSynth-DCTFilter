@@ -193,7 +193,9 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
                 throw std::string{ "factor must be between 0.0 and 1.0 (inclusive)" };
         }
 
-        const unsigned numThreads = vsapi->getCoreInfo(core)->numThreads;
+        VSCoreInfo coreinfo;
+        vsapi->getCoreInfo2(core, &coreinfo);
+        const unsigned numThreads = coreinfo.numThreads;
         d->buffer.reserve(numThreads);
 
         if (d->vi->format->sampleType == stInteger)
