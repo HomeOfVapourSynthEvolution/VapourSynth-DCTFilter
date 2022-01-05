@@ -23,6 +23,7 @@
 */
 
 #include <algorithm>
+#include <cmath>
 #include <memory>
 #include <string>
 #include <thread>
@@ -41,6 +42,7 @@ struct DCTFilterData {
     bool process[3];
     int peak;
     int n;
+    std::vector<float> qps;
     std::vector<float> factors;
     fftwf_plan dct, idct;
     std::unordered_map<std::thread::id, float *> buffer;
@@ -60,7 +62,6 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, const DCTFilterDat
             T * VS_RESTRICT dstp = reinterpret_cast<T *>(vsapi->getWritePtr(dst, plane));
 
             const int n = d->n;
-	    const float norm = 1.f / (d->n * d->n * 4);
             for (int y = 0; y < height; y += n) {
                 for (int x = 0; x < width; x += n) {
                     for (int yy = 0; yy < n; yy++) {
@@ -68,13 +69,17 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, const DCTFilterDat
                         float * VS_RESTRICT output = buffer + n * yy;
 
                         for (int xx = 0; xx < n; xx++)
-                            output[xx] = input[xx] * norm;
+                            output[xx] = input[xx];
                     }
 
                     fftwf_execute_r2r(d->dct, buffer, buffer);
 
-                    for (int i = 0; i < n*n; i++)
+                    for (int i = 0; i < n * n; i++) {
                         buffer[i] *= d->factors[i];
+                        if (d->qps[i] > 0.0f) {
+                            buffer[i] -= fmodf(buffer[i], d->qps[i]);
+                        }
+                    }
 
                     fftwf_execute_r2r(d->idct, buffer, buffer);
 
@@ -207,6 +212,11 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
                 throw std::string{ "factor must be between 0.0 and 1.0 (inclusive)" };
         }
 
+        const double * qps = vsapi->propGetFloatArray(in, "qps", nullptr);
+        const int nqps = vsapi->propNumElements(in, "qps");
+        if (nqps != d->n && nqps != d->n * d->n)
+            throw std::string{ "the number of qps must be equal to either n or n*n" };
+
         VSCoreInfo coreinfo;
         vsapi->getCoreInfo2(core, &coreinfo);
         const unsigned numThreads = coreinfo.numThreads;
@@ -239,14 +249,38 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
         }
 
         d->factors.resize(d->n * d->n);
+        const auto norm = 1.f / (d->n * d->n * 4);
         if (nfactors != d->n) {
             for (int i = 0; i < nfactors; i++)
-                d->factors[i] = static_cast<float>(factors[i]);
+                d->factors[i] = static_cast<float>(factors[i]) * norm;
         } else {
             for (int y = 0; y < d->n; y++) {
                 for (int x = 0; x < d->n; x++)
-                    d->factors[d->n * y + x] = static_cast<float>(factors[y] * factors[x]);
+                    d->factors[d->n * y + x] = static_cast<float>(factors[y] * factors[x]) * norm;
             }
+        }
+
+        d->qps.resize(d->n * d->n);
+        if (nqps != d->n) {
+            for (int i = 0; i < nqps; i++)
+                d->qps[i] = static_cast<float>(qps[i]);
+        } else {
+            for (int y = 0; y < d->n; y++) {
+                for (int x = 0; x < d->n; x++)
+                    d->qps[d->n * y + x] = static_cast<float>(qps[y] * qps[x]);
+            }
+        }
+        if (d->vi->format->sampleType == stInteger) {
+            for (int i = 0; i < d->n * d->n; i++) {
+                d->qps[i] *= (1 << d->vi->format->bitsPerSample) - 1;
+            }
+        }
+        d->qps[0] *= 2;
+        for (int i = 1; i < d->n; i++) {
+            d->qps[i] *= std::sqrt(2.0f);
+        }
+        for (int i = 1; i < d->n; i++) {
+            d->qps[d->n * i] *= std::sqrt(2.0f);
         }
 
         float * buffer = fftwf_alloc_real(d->n * d->n);
@@ -300,6 +334,7 @@ VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegiste
                  "clip:clip;"
                  "factors:float[];"
                  "planes:int[]:opt;"
-                 "n:int:opt;",
+                 "n:int:opt;"
+                 "qps:float[]:opt;",
                  dctfilterCreate, nullptr, plugin);
 }
