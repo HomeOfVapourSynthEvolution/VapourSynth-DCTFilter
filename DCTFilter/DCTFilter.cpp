@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <cmath>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -46,12 +48,18 @@ struct DCTFilterData {
     std::vector<float> factors;
     fftwf_plan dct, idct;
     std::unordered_map<std::thread::id, float *> buffer;
+    std::shared_mutex buffer_lock;
 };
 
 template<typename T>
-static void process(const VSFrameRef * src, VSFrameRef * dst, const DCTFilterData * d, const VSAPI * vsapi) noexcept {
+static void process(const VSFrameRef * src, VSFrameRef * dst, DCTFilterData * d, const VSAPI * vsapi) noexcept {
     const auto threadId = std::this_thread::get_id();
-    float * VS_RESTRICT buffer = d->buffer.at(threadId);
+    float * VS_RESTRICT buffer;
+    {
+        d->buffer_lock.lock_shared();
+        buffer = d->buffer[threadId];
+        d->buffer_lock.unlock_shared();
+    }
 
     for (int plane = 0; plane < d->vi->format->numPlanes; plane++) {
         if (d->process[plane]) {
@@ -121,7 +129,11 @@ static const VSFrameRef *VS_CC dctfilterGetFrame(int n, int activationReason, vo
                 float * buffer = fftwf_alloc_real(d->n * d->n);
                 if (!buffer)
                     throw std::string{ "malloc failure (buffer)" };
-                d->buffer.emplace(threadId, buffer);
+
+                {
+                    std::scoped_lock<std::shared_mutex> l(d->buffer_lock);
+                    d->buffer.emplace(threadId, buffer);
+                }
             }
         } catch (const std::string & error) {
             vsapi->setFilterError(("DCTFilter: " + error).c_str(), frameCtx);
@@ -212,11 +224,6 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
                 throw std::string{ "factor must be between 0.0 and 1.0 (inclusive)" };
         }
 
-        const double * qps = vsapi->propGetFloatArray(in, "qps", nullptr);
-        const int nqps = vsapi->propNumElements(in, "qps");
-        if (nqps != d->n && nqps != d->n * d->n)
-            throw std::string{ "the number of qps must be equal to either n or n*n" };
-
         VSCoreInfo coreinfo;
         vsapi->getCoreInfo2(core, &coreinfo);
         const unsigned numThreads = coreinfo.numThreads;
@@ -260,27 +267,34 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
             }
         }
 
-        d->qps.resize(d->n * d->n);
-        if (nqps != d->n) {
-            for (int i = 0; i < nqps; i++)
-                d->qps[i] = static_cast<float>(qps[i]);
-        } else {
-            for (int y = 0; y < d->n; y++) {
-                for (int x = 0; x < d->n; x++)
-                    d->qps[d->n * y + x] = static_cast<float>(qps[y] * qps[x]);
+        d->qps.resize(d->n * d->n, 0);
+        const int nqps = vsapi->propNumElements(in, "qps");
+        if (nqps > 0) {
+            const double * qps = vsapi->propGetFloatArray(in, "qps", nullptr);
+            if (nqps != d->n && nqps != d->n * d->n)
+                throw std::string{ "the number of qps must be equal to either n or n*n" };
+
+            if (nqps != d->n) {
+                for (int i = 0; i < nqps; i++)
+                    d->qps[i] = static_cast<float>(qps[i]);
+            } else {
+                for (int y = 0; y < d->n; y++) {
+                    for (int x = 0; x < d->n; x++)
+                        d->qps[d->n * y + x] = static_cast<float>(qps[y] * qps[x]);
+                }
             }
-        }
-        if (d->vi->format->sampleType == stInteger) {
-            for (int i = 0; i < d->n * d->n; i++) {
-                d->qps[i] *= (1 << d->vi->format->bitsPerSample) - 1;
+            if (d->vi->format->sampleType == stInteger) {
+                for (int i = 0; i < d->n * d->n; i++) {
+                    d->qps[i] *= (1 << d->vi->format->bitsPerSample) - 1;
+                }
             }
-        }
-        d->qps[0] *= 2;
-        for (int i = 1; i < d->n; i++) {
-            d->qps[i] *= std::sqrt(2.0f);
-        }
-        for (int i = 1; i < d->n; i++) {
-            d->qps[d->n * i] *= std::sqrt(2.0f);
+            d->qps[0] *= 2;
+            for (int i = 1; i < d->n; i++) {
+                d->qps[i] *= std::sqrt(2.0f);
+            }
+            for (int i = 1; i < d->n; i++) {
+                d->qps[d->n * i] *= std::sqrt(2.0f);
+            }
         }
 
         float * buffer = fftwf_alloc_real(d->n * d->n);
