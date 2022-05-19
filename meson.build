@@ -1,5 +1,5 @@
 project('DCTFilter', 'cpp',
-  default_options : ['buildtype=release', 'b_ndebug=if-release', 'cpp_std=c++14'],
+  default_options : ['buildtype=release', 'b_ndebug=if-release', 'cpp_std=c++17'],
   meson_version : '>=0.49.0',
   version : '2'
 )
