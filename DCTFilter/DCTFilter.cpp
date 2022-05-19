@@ -131,7 +131,7 @@ static const VSFrameRef *VS_CC dctfilterGetFrame(int n, int activationReason, vo
                     throw std::string{ "malloc failure (buffer)" };
 
                 {
-                    std::scoped_lock<std::shared_mutex> l(d->buffer_lock);
+                    std::lock_guard<std::shared_mutex> l(d->buffer_lock);
                     d->buffer.emplace(threadId, buffer);
                 }
             }
@@ -267,7 +267,7 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
             }
         }
 
-        d->qps.resize(d->n * d->n, 0);
+        d->qps.resize(d->n * d->n);
         const int nqps = vsapi->propNumElements(in, "qps");
         if (nqps > 0) {
             const double * qps = vsapi->propGetFloatArray(in, "qps", nullptr);
