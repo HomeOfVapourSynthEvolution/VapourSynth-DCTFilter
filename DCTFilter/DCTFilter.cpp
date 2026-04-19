@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -36,6 +37,8 @@
 
 using namespace std::string_literals;
 
+std::mutex plan_mutex;
+
 struct DCTFilterData final {
     VSNode* node;
     const VSVideoInfo* vi;
@@ -43,15 +46,13 @@ struct DCTFilterData final {
     bool process[3];
     fftwf_plan dct, idct;
     int peak;
-    std::unordered_map<std::thread::id, float*> buffer;
-    void (*filter)(const VSFrame* src, VSFrame* dst, const DCTFilterData* VS_RESTRICT d, const VSAPI* vsapi) noexcept;
+    std::mutex map_mutex;
+    std::unordered_map<std::thread::id, std::unique_ptr<float[], decltype(&fftwf_free)>> buffer;
+    void (*filter)(const VSFrame* src, VSFrame* dst, float* VS_RESTRICT buffer, const DCTFilterData* VS_RESTRICT d, const VSAPI* vsapi) noexcept;
 };
 
 template<typename pixel_t>
-static void filter(const VSFrame* src, VSFrame* dst, const DCTFilterData* VS_RESTRICT d, const VSAPI* vsapi) noexcept {
-    const auto threadId = std::this_thread::get_id();
-    float* VS_RESTRICT buffer = d->buffer.at(threadId);
-
+static void filter(const VSFrame* src, VSFrame* dst, float* VS_RESTRICT buffer, const DCTFilterData* VS_RESTRICT d, const VSAPI* vsapi) noexcept {
     for (int plane = 0; plane < d->vi->format.numPlanes; plane++) {
         if (d->process[plane]) {
             const int width = vsapi->getFrameWidth(src, plane);
@@ -104,15 +105,20 @@ static const VSFrame* VS_CC dctFilterGetFrame(int n, int activationReason, void*
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
-        try {
-            auto threadId = std::this_thread::get_id();
+        float* buffer;
 
-            if (!d->buffer.count(threadId)) {
-                float* buffer = fftwf_alloc_real(64);
-                if (!buffer)
-                    throw std::string{ "malloc failure (buffer)" };
-                d->buffer.emplace(threadId, buffer);
+        try {
+            auto threadID = std::this_thread::get_id();
+            std::lock_guard<std::mutex> lock(d->map_mutex);
+
+            if (!d->buffer.count(threadID)) {
+                float* _buffer = fftwf_alloc_real(64);
+                if (!_buffer)
+                    throw "malloc failure (buffer)"s;
+                d->buffer.emplace(threadID, std::unique_ptr<float[], decltype(&fftwf_free)>(_buffer, &fftwf_free));
             }
+
+            buffer = d->buffer.at(threadID).get();
         } catch (const std::string& error) {
             vsapi->setFilterError(("DCTFilter: " + error).c_str(), frameCtx);
             return nullptr;
@@ -123,7 +129,7 @@ static const VSFrame* VS_CC dctFilterGetFrame(int n, int activationReason, void*
         const int pl[] = { 0, 1, 2 };
         VSFrame* dst = vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
 
-        d->filter(src, dst, d, vsapi);
+        d->filter(src, dst, buffer, d, vsapi);
 
         vsapi->freeFrame(src);
         return dst;
@@ -137,11 +143,11 @@ static void VS_CC dctFilterFree(void* instanceData, [[maybe_unused]] VSCore* cor
 
     vsapi->freeNode(d->node);
 
-    fftwf_destroy_plan(d->dct);
-    fftwf_destroy_plan(d->idct);
-
-    for (auto& iter : d->buffer)
-        fftwf_free(iter.second);
+    {
+        std::lock_guard<std::mutex> lock(plan_mutex);
+        fftwf_destroy_plan(d->dct);
+        fftwf_destroy_plan(d->idct);
+    }
 
     delete d;
 }
@@ -193,14 +199,13 @@ static void VS_CC dctFilterCreate(const VSMap* in, VSMap* out, [[maybe_unused]] 
                 d->factors[8 * y + x] = static_cast<float>(factors[y] * factors[x]);
         }
 
-        float* buffer = fftwf_alloc_real(64);
-        if (!buffer)
-            throw "malloc failure (buffer)"s;
+        std::unique_ptr<float[], decltype(&fftwf_free)> buffer(fftwf_alloc_real(64), &fftwf_free);
 
-        d->dct = fftwf_plan_r2r_2d(8, 8, buffer, buffer, FFTW_REDFT10, FFTW_REDFT10, FFTW_PATIENT);
-        d->idct = fftwf_plan_r2r_2d(8, 8, buffer, buffer, FFTW_REDFT01, FFTW_REDFT01, FFTW_PATIENT);
-
-        fftwf_free(buffer);
+        {
+            std::lock_guard<std::mutex> lock(plan_mutex);
+            d->dct = fftwf_plan_r2r_2d(8, 8, buffer.get(), buffer.get(), FFTW_REDFT10, FFTW_REDFT10, FFTW_PATIENT);
+            d->idct = fftwf_plan_r2r_2d(8, 8, buffer.get(), buffer.get(), FFTW_REDFT01, FFTW_REDFT01, FFTW_PATIENT);
+        }
 
         if (d->vi->format.sampleType == stInteger)
             d->peak = (1 << d->vi->format.bitsPerSample) - 1;
