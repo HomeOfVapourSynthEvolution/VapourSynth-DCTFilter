@@ -37,7 +37,7 @@
 
 using namespace std::string_literals;
 
-std::mutex plan_mutex;
+static std::mutex planMutex;
 
 struct DCTFilterData final {
     VSNode* node;
@@ -46,7 +46,7 @@ struct DCTFilterData final {
     bool process[3];
     fftwf_plan dct, idct;
     int peak;
-    std::mutex map_mutex;
+    std::mutex mapMutex;
     std::unordered_map<std::thread::id, std::unique_ptr<float[], decltype(&fftwf_free)>> buffer;
     void (*filter)(const VSFrame* src, VSFrame* dst, float* VS_RESTRICT buffer, const DCTFilterData* VS_RESTRICT d, const VSAPI* vsapi) noexcept;
 };
@@ -109,7 +109,7 @@ static const VSFrame* VS_CC dctFilterGetFrame(int n, int activationReason, void*
 
         try {
             auto threadID = std::this_thread::get_id();
-            std::lock_guard<std::mutex> lock(d->map_mutex);
+            std::lock_guard<std::mutex> lock(d->mapMutex);
 
             if (!d->buffer.count(threadID)) {
                 float* _buffer = fftwf_alloc_real(64);
@@ -144,7 +144,7 @@ static void VS_CC dctFilterFree(void* instanceData, [[maybe_unused]] VSCore* cor
     vsapi->freeNode(d->node);
 
     {
-        std::lock_guard<std::mutex> lock(plan_mutex);
+        std::lock_guard<std::mutex> lock(planMutex);
         fftwf_destroy_plan(d->dct);
         fftwf_destroy_plan(d->idct);
     }
@@ -202,7 +202,7 @@ static void VS_CC dctFilterCreate(const VSMap* in, VSMap* out, [[maybe_unused]] 
         std::unique_ptr<float[], decltype(&fftwf_free)> buffer(fftwf_alloc_real(64), &fftwf_free);
 
         {
-            std::lock_guard<std::mutex> lock(plan_mutex);
+            std::lock_guard<std::mutex> lock(planMutex);
             d->dct = fftwf_plan_r2r_2d(8, 8, buffer.get(), buffer.get(), FFTW_REDFT10, FFTW_REDFT10, FFTW_PATIENT);
             d->idct = fftwf_plan_r2r_2d(8, 8, buffer.get(), buffer.get(), FFTW_REDFT01, FFTW_REDFT01, FFTW_PATIENT);
         }
