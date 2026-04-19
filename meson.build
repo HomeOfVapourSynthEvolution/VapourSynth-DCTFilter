@@ -1,24 +1,23 @@
 project('DCTFilter', 'cpp',
-  default_options : ['buildtype=release', 'b_ndebug=if-release', 'cpp_std=c++14'],
-  meson_version : '>=0.48.0',
-  version : '2'
+    default_options: ['buildtype=release', 'warning_level=2', 'b_lto=true', 'b_ndebug=if-release', 'cpp_std=c++17'],
+    license: 'MIT',
+    license_files: 'LICENSE',
+    meson_version: '>=1.2.3',
+    version: '2.1',
 )
 
-sources = 'DCTFilter/DCTFilter.cpp'
+py = import('python').find_installation(pure: false)
 
-vapoursynth_dep = dependency('vapoursynth').partial_dependency(compile_args : true, includes : true)
+incdir = include_directories(
+    run_command(py, '-c', 'import vapoursynth as vs; print(vs.get_include())', check: true).stdout().strip(),
+)
 
-fftw3f_dep = dependency('fftw3f')
-
-add_project_arguments('-ffast-math', language : 'cpp')
-
-if host_machine.cpu_family().startswith('x86')
-  add_project_arguments('-mfpmath=sse', '-msse2', language : 'cpp')
-endif
-
-shared_module('dctfilter', sources,
-  dependencies : [vapoursynth_dep, fftw3f_dep],
-  install : true,
-  install_dir : join_paths(vapoursynth_dep.get_pkgconfig_variable('libdir'), 'vapoursynth'),
-  gnu_symbol_visibility : 'hidden'
+shared_module('dctfilter',
+    files('DCTFilter/DCTFilter.cpp'),
+    dependencies: dependency('fftw3f'),
+    gnu_symbol_visibility: 'hidden',
+    include_directories: incdir,
+    install: true,
+    install_dir: py.get_install_dir() / 'vapoursynth/plugins',
+    name_prefix: '',
 )
