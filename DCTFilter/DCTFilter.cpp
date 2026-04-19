@@ -29,42 +29,45 @@
 #include <type_traits>
 #include <unordered_map>
 
-#include <VapourSynth.h>
-#include <VSHelper.h>
+#include <VapourSynth4.h>
+#include <VSHelper4.h>
 
 #include <fftw3.h>
 
-struct DCTFilterData {
-    VSNodeRef * node;
-    const VSVideoInfo * vi;
-    bool process[3];
-    int peak;
+using namespace std::string_literals;
+
+struct DCTFilterData final {
+    VSNode* node;
+    const VSVideoInfo* vi;
     float factors[64];
+    bool process[3];
     fftwf_plan dct, idct;
-    std::unordered_map<std::thread::id, float *> buffer;
+    int peak;
+    std::unordered_map<std::thread::id, float*> buffer;
+    void (*filter)(const VSFrame* src, VSFrame* dst, const DCTFilterData* VS_RESTRICT d, const VSAPI* vsapi) noexcept;
 };
 
-template<typename T>
-static void process(const VSFrameRef * src, VSFrameRef * dst, const DCTFilterData * d, const VSAPI * vsapi) noexcept {
+template<typename pixel_t>
+static void filter(const VSFrame* src, VSFrame* dst, const DCTFilterData* VS_RESTRICT d, const VSAPI* vsapi) noexcept {
     const auto threadId = std::this_thread::get_id();
-    float * VS_RESTRICT buffer = d->buffer.at(threadId);
+    float* VS_RESTRICT buffer = d->buffer.at(threadId);
 
-    for (int plane = 0; plane < d->vi->format->numPlanes; plane++) {
+    for (int plane = 0; plane < d->vi->format.numPlanes; plane++) {
         if (d->process[plane]) {
             const int width = vsapi->getFrameWidth(src, plane);
             const int height = vsapi->getFrameHeight(src, plane);
-            const int stride = vsapi->getStride(src, plane) / sizeof(T);
-            const T * srcp = reinterpret_cast<const T *>(vsapi->getReadPtr(src, plane));
-            T * VS_RESTRICT dstp = reinterpret_cast<T *>(vsapi->getWritePtr(dst, plane));
+            const ptrdiff_t stride = vsapi->getStride(src, plane) / sizeof(pixel_t);
+            const pixel_t* srcp = reinterpret_cast<const pixel_t*>(vsapi->getReadPtr(src, plane));
+            pixel_t* VS_RESTRICT dstp = reinterpret_cast<pixel_t*>(vsapi->getWritePtr(dst, plane));
 
             for (int y = 0; y < height; y += 8) {
                 for (int x = 0; x < width; x += 8) {
                     for (int yy = 0; yy < 8; yy++) {
-                        const T * input = srcp + stride * yy + x;
-                        float * VS_RESTRICT output = buffer + 8 * yy;
+                        const pixel_t* input = srcp + stride * yy + x;
+                        float* VS_RESTRICT output = buffer + 8 * yy;
 
                         for (int xx = 0; xx < 8; xx++)
-                            output[xx] = input[xx] * (1.f / 256.f);
+                            output[xx] = input[xx] * (1.0f / 256.0f);
                     }
 
                     fftwf_execute_r2r(d->dct, buffer, buffer);
@@ -75,11 +78,11 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, const DCTFilterDat
                     fftwf_execute_r2r(d->idct, buffer, buffer);
 
                     for (int yy = 0; yy < 8; yy++) {
-                        const float * input = buffer + 8 * yy;
-                        T * VS_RESTRICT output = dstp + stride * yy + x;
+                        const float* input = buffer + 8 * yy;
+                        pixel_t* VS_RESTRICT output = dstp + stride * yy + x;
 
                         for (int xx = 0; xx < 8; xx++) {
-                            if (std::is_integral<T>::value)
+                            if constexpr (std::is_integral_v<pixel_t>)
                                 output[xx] = std::min(std::max(static_cast<int>(input[xx] + 0.5f), 0), d->peak);
                             else
                                 output[xx] = input[xx];
@@ -94,13 +97,9 @@ static void process(const VSFrameRef * src, VSFrameRef * dst, const DCTFilterDat
     }
 }
 
-static void VS_CC dctfilterInit(VSMap *in, VSMap *out, void **instanceData, VSNode *node, VSCore *core, const VSAPI *vsapi) {
-    DCTFilterData * d = static_cast<DCTFilterData *>(*instanceData);
-    vsapi->setVideoInfo(d->vi, 1, node);
-}
-
-static const VSFrameRef *VS_CC dctfilterGetFrame(int n, int activationReason, void **instanceData, void **frameData, VSFrameContext *frameCtx, VSCore *core, const VSAPI *vsapi) {
-    DCTFilterData * d = static_cast<DCTFilterData *>(*instanceData);
+static const VSFrame* VS_CC dctFilterGetFrame(int n, int activationReason, void* instanceData, [[maybe_unused]] void** frameData, VSFrameContext* frameCtx,
+                                              VSCore* core, const VSAPI* vsapi) {
+    auto d = static_cast<DCTFilterData*>(instanceData);
 
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
@@ -109,27 +108,22 @@ static const VSFrameRef *VS_CC dctfilterGetFrame(int n, int activationReason, vo
             auto threadId = std::this_thread::get_id();
 
             if (!d->buffer.count(threadId)) {
-                float * buffer = fftwf_alloc_real(64);
+                float* buffer = fftwf_alloc_real(64);
                 if (!buffer)
                     throw std::string{ "malloc failure (buffer)" };
                 d->buffer.emplace(threadId, buffer);
             }
-        } catch (const std::string & error) {
+        } catch (const std::string& error) {
             vsapi->setFilterError(("DCTFilter: " + error).c_str(), frameCtx);
             return nullptr;
         }
 
-        const VSFrameRef * src = vsapi->getFrameFilter(n, d->node, frameCtx);
-        const VSFrameRef * fr[] = { d->process[0] ? nullptr : src, d->process[1] ? nullptr : src, d->process[2] ? nullptr : src };
+        const VSFrame* src = vsapi->getFrameFilter(n, d->node, frameCtx);
+        const VSFrame* fr[] = { d->process[0] ? nullptr : src, d->process[1] ? nullptr : src, d->process[2] ? nullptr : src };
         const int pl[] = { 0, 1, 2 };
-        VSFrameRef * dst = vsapi->newVideoFrame2(d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
+        VSFrame* dst = vsapi->newVideoFrame2(&d->vi->format, d->vi->width, d->vi->height, fr, pl, src, core);
 
-        if (d->vi->format->bytesPerSample == 1)
-            process<uint8_t>(src, dst, d, vsapi);
-        else if (d->vi->format->bytesPerSample == 2)
-            process<uint16_t>(src, dst, d, vsapi);
-        else
-            process<float>(src, dst, d, vsapi);
+        d->filter(src, dst, d, vsapi);
 
         vsapi->freeFrame(src);
         return dst;
@@ -138,88 +132,60 @@ static const VSFrameRef *VS_CC dctfilterGetFrame(int n, int activationReason, vo
     return nullptr;
 }
 
-static void VS_CC dctfilterFree(void *instanceData, VSCore *core, const VSAPI *vsapi) {
-    DCTFilterData * d = static_cast<DCTFilterData *>(instanceData);
+static void VS_CC dctFilterFree(void* instanceData, [[maybe_unused]] VSCore* core, const VSAPI* vsapi) {
+    auto d = static_cast<DCTFilterData*>(instanceData);
 
     vsapi->freeNode(d->node);
 
     fftwf_destroy_plan(d->dct);
     fftwf_destroy_plan(d->idct);
 
-    for (auto & iter : d->buffer)
+    for (auto& iter : d->buffer)
         fftwf_free(iter.second);
 
     delete d;
 }
 
-static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, VSCore *core, const VSAPI *vsapi) {
-    std::unique_ptr<DCTFilterData> d{ new DCTFilterData{} };
+static void VS_CC dctFilterCreate(const VSMap* in, VSMap* out, [[maybe_unused]] void* userData, VSCore* core, const VSAPI* vsapi) {
+    auto d = std::make_unique<DCTFilterData>();
 
-    d->node = vsapi->propGetNode(in, "clip", 0, nullptr);
+    d->node = vsapi->mapGetNode(in, "clip", 0, nullptr);
     d->vi = vsapi->getVideoInfo(d->node);
 
     const int padWidth = (d->vi->width & 15) ? 16 - d->vi->width % 16 : 0;
     const int padHeight = (d->vi->height & 15) ? 16 - d->vi->height % 16 : 0;
 
     try {
-        if (!isConstantFormat(d->vi) || (d->vi->format->sampleType == stInteger && d->vi->format->bitsPerSample > 16) ||
-            (d->vi->format->sampleType == stFloat && d->vi->format->bitsPerSample != 32))
-            throw std::string{ "only constant format 8-16 bit integer and 32 bit float input supported" };
+        if (!vsh::isConstantVideoFormat(d->vi) ||
+            (d->vi->format.sampleType == stInteger && d->vi->format.bitsPerSample > 16) ||
+            (d->vi->format.sampleType == stFloat && d->vi->format.bitsPerSample != 32))
+            throw "only constant format 8-16 bit integer and 32 bit float input supported"s;
 
-        const double * factors = vsapi->propGetFloatArray(in, "factors", nullptr);
+        const double* factors = vsapi->mapGetFloatArray(in, "factors", nullptr);
 
-        const int m = vsapi->propNumElements(in, "planes");
+        const int m = vsapi->mapNumElements(in, "planes");
 
         for (int i = 0; i < 3; i++)
             d->process[i] = (m <= 0);
 
         for (int i = 0; i < m; i++) {
-            const int n = int64ToIntS(vsapi->propGetInt(in, "planes", i, nullptr));
+            const int n = vsapi->mapGetIntSaturated(in, "planes", i, nullptr);
 
-            if (n < 0 || n >= d->vi->format->numPlanes)
-                throw std::string{ "plane index out of range" };
+            if (n < 0 || n >= d->vi->format.numPlanes)
+                throw "plane index out of range"s;
 
             if (d->process[n])
-                throw std::string{ "plane specified twice" };
+                throw "plane specified twice"s;
 
             d->process[n] = true;
         }
 
-        if (vsapi->propNumElements(in, "factors") != 8)
-            throw std::string{ "the number of factors must be 8" };
+        if (vsapi->mapNumElements(in, "factors") != 8)
+            throw "number of elements in factors must be 8"s;
 
         for (int i = 0; i < 8; i++) {
-            if (factors[i] < 0. || factors[i] > 1.)
-                throw std::string{ "factor must be between 0.0 and 1.0 (inclusive)" };
-        }
-
-        const unsigned numThreads = vsapi->getCoreInfo(core)->numThreads;
-        d->buffer.reserve(numThreads);
-
-        if (d->vi->format->sampleType == stInteger)
-            d->peak = (1 << d->vi->format->bitsPerSample) - 1;
-
-        if (padWidth || padHeight) {
-            VSMap * args = vsapi->createMap();
-            vsapi->propSetNode(args, "clip", d->node, paReplace);
-            vsapi->freeNode(d->node);
-            vsapi->propSetInt(args, "width", d->vi->width + padWidth, paReplace);
-            vsapi->propSetInt(args, "height", d->vi->height + padHeight, paReplace);
-            vsapi->propSetFloat(args, "src_width", d->vi->width + padWidth, paReplace);
-            vsapi->propSetFloat(args, "src_height", d->vi->height + padHeight, paReplace);
-
-            VSMap * ret = vsapi->invoke(vsapi->getPluginById("com.vapoursynth.resize", core), "Point", args);
-            if (vsapi->getError(ret)) {
-                vsapi->setError(out, vsapi->getError(ret));
-                vsapi->freeMap(args);
-                vsapi->freeMap(ret);
-                return;
-            }
-
-            d->node = vsapi->propGetNode(ret, "clip", 0, nullptr);
-            d->vi = vsapi->getVideoInfo(d->node);
-            vsapi->freeMap(args);
-            vsapi->freeMap(ret);
+            if (factors[i] < 0.0 || factors[i] > 1.0)
+                throw "factor must be between 0.0 and 1.0 (inclusive)"s;
         }
 
         for (int y = 0; y < 8; y++) {
@@ -227,56 +193,89 @@ static void VS_CC dctfilterCreate(const VSMap *in, VSMap *out, void *userData, V
                 d->factors[8 * y + x] = static_cast<float>(factors[y] * factors[x]);
         }
 
-        float * buffer = fftwf_alloc_real(64);
+        float* buffer = fftwf_alloc_real(64);
         if (!buffer)
-            throw std::string{ "malloc failure (buffer)" };
+            throw "malloc failure (buffer)"s;
 
         d->dct = fftwf_plan_r2r_2d(8, 8, buffer, buffer, FFTW_REDFT10, FFTW_REDFT10, FFTW_PATIENT);
         d->idct = fftwf_plan_r2r_2d(8, 8, buffer, buffer, FFTW_REDFT01, FFTW_REDFT01, FFTW_PATIENT);
 
         fftwf_free(buffer);
-    } catch (const std::string & error) {
-        vsapi->setError(out, ("DCTFilter: " + error).c_str());
+
+        if (d->vi->format.sampleType == stInteger)
+            d->peak = (1 << d->vi->format.bitsPerSample) - 1;
+
+        if (d->vi->format.bytesPerSample == 1)
+            d->filter = filter<uint8_t>;
+        else if (d->vi->format.bytesPerSample == 2)
+            d->filter = filter<uint16_t>;
+        else
+            d->filter = filter<float>;
+
+        VSCoreInfo info;
+        vsapi->getCoreInfo(core, &info);
+        d->buffer.reserve(info.numThreads);
+
+        if (padWidth || padHeight) {
+            VSMap* args = vsapi->createMap();
+            vsapi->mapConsumeNode(args, "clip", d->node, maReplace);
+            vsapi->mapSetInt(args, "width", d->vi->width + padWidth, maReplace);
+            vsapi->mapSetInt(args, "height", d->vi->height + padHeight, maReplace);
+            vsapi->mapSetFloat(args, "src_width", d->vi->width + padWidth, maReplace);
+            vsapi->mapSetFloat(args, "src_height", d->vi->height + padHeight, maReplace);
+
+            VSMap* ret = vsapi->invoke(vsapi->getPluginByID(VSH_RESIZE_PLUGIN_ID, core), "Point", args);
+            if (vsapi->mapGetError(ret)) {
+                vsapi->mapSetError(out, vsapi->mapGetError(ret));
+                vsapi->freeMap(args);
+                vsapi->freeMap(ret);
+                return;
+            }
+
+            d->node = vsapi->mapGetNode(ret, "clip", 0, nullptr);
+            d->vi = vsapi->getVideoInfo(d->node);
+            vsapi->freeMap(args);
+            vsapi->freeMap(ret);
+        }
+    } catch (const std::string& error) {
+        vsapi->mapSetError(out, ("DCTFilter: " + error).c_str());
         vsapi->freeNode(d->node);
         return;
     }
 
-    vsapi->createFilter(in, out, "DCTFilter", dctfilterInit, dctfilterGetFrame, dctfilterFree, fmParallel, 0, d.release(), core);
+    VSFilterDependency deps[] = { {d->node, rpStrictSpatial} };
+    vsapi->createVideoFilter(out, "DCTFilter", d->vi, dctFilterGetFrame, dctFilterFree, fmParallel, deps, 1, d.get(), core);
+    d.release();
 
     if (padWidth || padHeight) {
-        VSNodeRef * node = vsapi->propGetNode(out, "clip", 0, nullptr);
+        VSNode* node = vsapi->mapGetNode(out, "clip", 0, nullptr);
         vsapi->clearMap(out);
 
-        VSMap * args = vsapi->createMap();
-        vsapi->propSetNode(args, "clip", node, paReplace);
-        vsapi->freeNode(node);
-        vsapi->propSetInt(args, "right", padWidth, paReplace);
-        vsapi->propSetInt(args, "bottom", padHeight, paReplace);
+        VSMap* args = vsapi->createMap();
+        vsapi->mapConsumeNode(args, "clip", node, maReplace);
+        vsapi->mapSetInt(args, "right", padWidth, maReplace);
+        vsapi->mapSetInt(args, "bottom", padHeight, maReplace);
 
-        VSMap * ret = vsapi->invoke(vsapi->getPluginById("com.vapoursynth.std", core), "Crop", args);
-        if (vsapi->getError(ret)) {
-            vsapi->setError(out, vsapi->getError(ret));
+        VSMap* ret = vsapi->invoke(vsapi->getPluginByID(VSH_STD_PLUGIN_ID, core), "Crop", args);
+        if (vsapi->mapGetError(ret)) {
+            vsapi->mapSetError(out, vsapi->mapGetError(ret));
             vsapi->freeMap(args);
             vsapi->freeMap(ret);
             return;
         }
 
-        node = vsapi->propGetNode(ret, "clip", 0, nullptr);
+        node = vsapi->mapGetNode(ret, "clip", 0, nullptr);
         vsapi->freeMap(args);
         vsapi->freeMap(ret);
-        vsapi->propSetNode(out, "clip", node, paReplace);
-        vsapi->freeNode(node);
+        vsapi->mapConsumeNode(out, "clip", node, maReplace);
     }
 }
 
 //////////////////////////////////////////
 // Init
 
-VS_EXTERNAL_API(void) VapourSynthPluginInit(VSConfigPlugin configFunc, VSRegisterFunction registerFunc, VSPlugin *plugin) {
-    configFunc("com.holywu.dctfilter", "dctf", "DCT/IDCT Frequency Suppressor", VAPOURSYNTH_API_VERSION, 1, plugin);
-    registerFunc("DCTFilter",
-                 "clip:clip;"
-                 "factors:float[];"
-                 "planes:int[]:opt;",
-                 dctfilterCreate, nullptr, plugin);
+VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
+    vspapi->configPlugin("com.holywu.dctfilter", "dctf", "DCT/IDCT Frequency Suppressor", VS_MAKE_VERSION(2, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
+
+    vspapi->registerFunction("DCTFilter", "clip:vnode;factors:float[];planes:int[]:opt;", "clip:vnode;", dctFilterCreate, nullptr, plugin);
 }
