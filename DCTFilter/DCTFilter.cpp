@@ -280,7 +280,7 @@ static void VS_CC dctFilterCreate(const VSMap* in, VSMap* out, [[maybe_unused]] 
 // Init
 
 VS_EXTERNAL_API(void) VapourSynthPluginInit2(VSPlugin* plugin, const VSPLUGINAPI* vspapi) {
-    vspapi->configPlugin("com.holywu.dctfilter", "dctf", "DCT/IDCT Frequency Suppressor", VS_MAKE_VERSION(3, 0), VAPOURSYNTH_API_VERSION, 0, plugin);
+    vspapi->configPlugin("com.holywu.dctfilter", "dctf", "DCT/IDCT Frequency Suppressor", VS_MAKE_VERSION(3, 1), VAPOURSYNTH_API_VERSION, 0, plugin);
 
     vspapi->registerFunction("DCTFilter", "clip:vnode;factors:float[];planes:int[]:opt;", "clip:vnode;", dctFilterCreate, nullptr, plugin);
 }
