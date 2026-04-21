@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <type_traits>
@@ -46,7 +47,7 @@ struct DCTFilterData final {
     bool process[3];
     fftwf_plan dct, idct;
     int peak;
-    std::mutex mapMutex;
+    std::shared_mutex mapMutex;
     std::unordered_map<std::thread::id, std::unique_ptr<float[], decltype(&fftwf_free)>> buffer;
     void (*filter)(const VSFrame* src, VSFrame* dst, float* VS_RESTRICT buffer, const DCTFilterData* VS_RESTRICT d, const VSAPI* vsapi) noexcept;
 };
@@ -109,16 +110,17 @@ static const VSFrame* VS_CC dctFilterGetFrame(int n, int activationReason, void*
 
         try {
             auto threadID = std::this_thread::get_id();
-            std::lock_guard<std::mutex> lock(d->mapMutex);
 
             if (!d->buffer.count(threadID)) {
-                float* _buffer = fftwf_alloc_real(64);
-                if (!_buffer)
+                buffer = fftwf_alloc_real(64);
+                if (!buffer)
                     throw "malloc failure (buffer)"s;
-                d->buffer.emplace(threadID, std::unique_ptr<float[], decltype(&fftwf_free)>(_buffer, &fftwf_free));
+                std::unique_lock<std::shared_mutex> lock(d->mapMutex);
+                d->buffer.emplace(threadID, std::unique_ptr<float[], decltype(&fftwf_free)>(buffer, &fftwf_free));
+            } else {
+                std::shared_lock<std::shared_mutex> lock(d->mapMutex);
+                buffer = d->buffer.at(threadID).get();
             }
-
-            buffer = d->buffer.at(threadID).get();
         } catch (const std::string& error) {
             vsapi->setFilterError(("DCTFilter: " + error).c_str(), frameCtx);
             return nullptr;
