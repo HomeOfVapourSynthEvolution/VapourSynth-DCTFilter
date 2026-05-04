@@ -3,7 +3,7 @@ project('DCTFilter', 'cpp',
     license: 'MIT',
     license_files: 'LICENSE',
     meson_version: '>=1.2.3',
-    version: '3.1',
+    version: '3.2',
 )
 
 py = import('python').find_installation(pure: false)
