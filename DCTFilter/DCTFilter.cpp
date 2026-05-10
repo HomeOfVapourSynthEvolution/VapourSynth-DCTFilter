@@ -47,8 +47,6 @@ struct DCTFilterData final {
     bool process[3];
     fftwf_plan dct, idct;
     int peak;
-    std::shared_mutex mapMutex;
-    std::unordered_map<std::thread::id, std::unique_ptr<float[], decltype(&fftwf_free)>> buffer;
     void (*filter)(const VSFrame* src, VSFrame* dst, float* VS_RESTRICT buffer, const DCTFilterData* VS_RESTRICT d, const VSAPI* vsapi) noexcept;
 };
 
@@ -106,25 +104,7 @@ static const VSFrame* VS_CC dctFilterGetFrame(int n, int activationReason, void*
     if (activationReason == arInitial) {
         vsapi->requestFrameFilter(n, d->node, frameCtx);
     } else if (activationReason == arAllFramesReady) {
-        float* buffer;
-
-        try {
-            auto threadID = std::this_thread::get_id();
-
-            if (!d->buffer.count(threadID)) {
-                std::unique_lock<std::shared_mutex> lock(d->mapMutex);
-                buffer = fftwf_alloc_real(64);
-                if (!buffer)
-                    throw "malloc failure (buffer)"s;
-                d->buffer.emplace(threadID, std::unique_ptr<float[], decltype(&fftwf_free)>(buffer, &fftwf_free));
-            } else {
-                std::shared_lock<std::shared_mutex> lock(d->mapMutex);
-                buffer = d->buffer.at(threadID).get();
-            }
-        } catch (const std::string& error) {
-            vsapi->setFilterError(("DCTFilter: " + error).c_str(), frameCtx);
-            return nullptr;
-        }
+        float *buffer = vsh::vsh_aligned_malloc<float>(64 * sizeof(float), 64);
 
         const VSFrame* src = vsapi->getFrameFilter(n, d->node, frameCtx);
         const VSFrame* fr[] = { d->process[0] ? nullptr : src, d->process[1] ? nullptr : src, d->process[2] ? nullptr : src };
@@ -133,6 +113,7 @@ static const VSFrame* VS_CC dctFilterGetFrame(int n, int activationReason, void*
 
         d->filter(src, dst, buffer, d, vsapi);
 
+        vsh::vsh_aligned_free(buffer);
         vsapi->freeFrame(src);
         return dst;
     }
@@ -201,13 +182,15 @@ static void VS_CC dctFilterCreate(const VSMap* in, VSMap* out, [[maybe_unused]] 
                 d->factors[8 * y + x] = static_cast<float>(factors[y] * factors[x]);
         }
 
-        std::unique_ptr<float[], decltype(&fftwf_free)> buffer(fftwf_alloc_real(64), &fftwf_free);
+        float* buffer = vsh::vsh_aligned_malloc<float>(64 * sizeof(float), 64);
 
         {
             std::lock_guard<std::mutex> lock(planMutex);
-            d->dct = fftwf_plan_r2r_2d(8, 8, buffer.get(), buffer.get(), FFTW_REDFT10, FFTW_REDFT10, FFTW_PATIENT);
-            d->idct = fftwf_plan_r2r_2d(8, 8, buffer.get(), buffer.get(), FFTW_REDFT01, FFTW_REDFT01, FFTW_PATIENT);
+            d->dct = fftwf_plan_r2r_2d(8, 8, buffer, buffer, FFTW_REDFT10, FFTW_REDFT10, FFTW_PATIENT);
+            d->idct = fftwf_plan_r2r_2d(8, 8, buffer, buffer, FFTW_REDFT01, FFTW_REDFT01, FFTW_PATIENT);
         }
+
+        vsh::vsh_aligned_free(buffer);
 
         if (d->vi->format.sampleType == stInteger)
             d->peak = (1 << d->vi->format.bitsPerSample) - 1;
@@ -218,10 +201,6 @@ static void VS_CC dctFilterCreate(const VSMap* in, VSMap* out, [[maybe_unused]] 
             d->filter = filter<uint16_t>;
         else
             d->filter = filter<float>;
-
-        VSCoreInfo info;
-        vsapi->getCoreInfo(core, &info);
-        d->buffer.reserve(info.numThreads);
 
         if (padWidth || padHeight) {
             VSMap* args = vsapi->createMap();
